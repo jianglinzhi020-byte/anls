@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 from changsha_monitoring.__main__ import main
 from changsha_monitoring.amap import AmapClient, AmapError
 from changsha_monitoring.cdi import (
+    cdi_for_observation,
     free_flow_speed,
+    series_baseline,
     service_minutes,
     tasks_from_samples,
 )
@@ -91,6 +93,19 @@ def test_tasks_merge_slots_and_skip_threshold() -> None:
     assert tasks[3].service_min == 6
     assert free_flow_speed([20.0]) == 50.0
     assert free_flow_speed([20.0, 80.0]) == 80.0
+
+
+def test_smooth_night_speed_is_not_treated_as_congestion() -> None:
+    free_flow, use_ratio = series_baseline([35.0], ["1"])
+    cdi = cdi_for_observation(free_flow, use_ratio, 35.0, "1")
+    assert cdi is not None
+    assert cdi <= 1.4
+    slow_flow, slow_ratio = series_baseline([30.0], ["2"])
+    slow_cdi = cdi_for_observation(slow_flow, slow_ratio, 30.0, "2")
+    assert slow_cdi == 1.6
+    day_flow, day_ratio = series_baseline([60.0, 30.0], ["1", "3"])
+    assert day_ratio is True
+    assert cdi_for_observation(day_flow, day_ratio, 30.0, "3") == 2.0
 
 
 def test_large_instance_caps_at_paper_scale() -> None:
@@ -331,10 +346,14 @@ def test_collect_series_is_resumable(tmp_path: Path) -> None:
 def test_cli_tiles_and_missing_key(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     assert main(["tiles", "--limit", "1"]) == 0
     assert "环带矩形" in capsys.readouterr().out
     monkeypatch.delenv("AMAP_KEY", raising=False)
     monkeypatch.delenv("GAODE_KEY", raising=False)
+    monkeypatch.setattr(
+        "changsha_monitoring.collect.KEY_FILE", tmp_path / "missing"
+    )
     assert main(["collect", "--once"]) == 2
     assert "AMAP_KEY" in capsys.readouterr().err

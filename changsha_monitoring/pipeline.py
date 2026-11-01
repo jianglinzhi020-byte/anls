@@ -8,10 +8,9 @@ from typing import TYPE_CHECKING
 
 from changsha_monitoring.amap import road_identity
 from changsha_monitoring.cdi import (
-    FREEFLOW_FLOOR_KMH,
     TASK_CDI,
-    congestion_delay_index,
-    free_flow_speed,
+    cdi_for_observation,
+    series_baseline,
     tasks_from_samples,
 )
 from changsha_monitoring.collect import SHANGHAI
@@ -73,6 +72,7 @@ def segments_from_snapshots(
             ):
                 continue
             speed = float(raw_speed)
+            status = str(road.get("status") or "").strip()
             key = road_identity(name, direction, lcodes, polyline)
             segment = by_key.get(key)
             points = parse_polyline_xy(polyline)
@@ -85,6 +85,7 @@ def segments_from_snapshots(
                 previous = segment.speeds.get(collected_at)
                 if previous is None or speed < previous:
                     segment.speeds[collected_at] = speed
+                    segment.statuses[collected_at] = status
     return list(by_key.values())
 
 
@@ -106,8 +107,11 @@ def build_monitoring_tasks(
             continue
         keys = [str(key) for key in raw_keys]
         incident = [by_key[key] for key in keys if key in by_key]
-        speeds = {
-            segment.key: free_flow_speed(list(segment.speeds.values()))
+        baselines = {
+            segment.key: series_baseline(
+                list(segment.speeds.values()),
+                list(segment.statuses.values()),
+            )
             for segment in incident
         }
         stamps = sorted(
@@ -120,7 +124,13 @@ def build_monitoring_tasks(
                 speed = segment.speeds.get(stamp)
                 if speed is None:
                     continue
-                cdi = congestion_delay_index(speeds[segment.key], speed)
+                free_flow, use_ratio = baselines[segment.key]
+                cdi = cdi_for_observation(
+                    free_flow,
+                    use_ratio,
+                    speed,
+                    segment.statuses.get(stamp, ""),
+                )
                 if cdi is not None:
                     values.append(cdi)
             if values:
@@ -242,9 +252,7 @@ def build_dataset(snapshot_dir: Path, out_dir: Path) -> dict[str, object]:
         "cdi": {
             "definition": "自由流速度 / 实测速度",
             "task_if_greater_than": TASK_CDI,
-            "freeflow": "全天最高速度不低于 {} km/h".format(
-                format(FREEFLOW_FLOOR_KMH, ".0f")
-            ),
+            "freeflow": "畅通样本用速度比,否则只认缓行及以上",
             "service_minutes": {
                 "cdi < 1.8": 3,
                 "1.8 <= cdi <= 2.5": 6,

@@ -6,7 +6,8 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Callable
+from pathlib import Path
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from changsha_monitoring.amap import (
@@ -25,19 +26,21 @@ from changsha_monitoring.region import (
     traffic_tiles,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+# 本地 Key 文件不进入 git。环境变量优先。
+KEY_FILE = Path("data/changsha/amap_key")
 
 
 def load_api_key() -> str:
     key = os.environ.get("AMAP_KEY") or os.environ.get("GAODE_KEY") or ""
-    if not key.strip():
+    if not key.strip() and KEY_FILE.is_file():
+        key = KEY_FILE.read_text(encoding="utf-8")
+    key = key.strip().strip('"').strip("'")
+    if not key:
         raise AmapError(
             "请设置环境变量 AMAP_KEY。" "该 Key 需开通交通态势服务。",
         )
-    return key.strip()
+    return key
 
 
 def align_slot(moment: datetime, interval_min: int) -> datetime:
@@ -119,6 +122,7 @@ def collect_series(
         path = out_dir / snapshot_name(slot)
         if path.exists():
             written.append(path)
+            print(f"跳过已有 {path.name}", flush=True)
         else:
             written.append(
                 collect_once(
@@ -130,6 +134,7 @@ def collect_series(
                     sleep=sleeper,
                 )
             )
+            print(f"已保存 {path.name}", flush=True)
         nxt = slot + timedelta(minutes=interval_min)
         if nxt >= deadline:
             break

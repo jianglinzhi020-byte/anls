@@ -9,14 +9,14 @@ from dataclasses import dataclass
 TASK_CDI = 1.4
 FREEFLOW_FLOOR_KMH = 50.0
 SLOT_MINUTES = 15
+# 不到 2 小时的样本里,最高速度往往就是夜间畅行速度,不能再抬到 50。
+MIN_SAMPLES_FOR_FLOOR = 8
+# 还没有自由流样本时,用高德路况状态兜底。1 是畅通。
+STATUS_FALLBACK_CDI = {"2": 1.6, "3": 2.0, "4": 2.8}
 
 
 def free_flow_speed(speeds_kmh: list[float]) -> float:
-    """路段自由流速度。
-
-    取全天观测到的最高速度。城市主要道路再与 50 km/h 取较大值,
-    避免整天低速时把自由流误当成拥堵速度。
-    """
+    """整天都偏慢时,用 50 km/h 作为主要道路的自由流下限。"""
     if not speeds_kmh:
         return FREEFLOW_FLOOR_KMH
     return max(max(speeds_kmh), FREEFLOW_FLOOR_KMH)
@@ -28,6 +28,43 @@ def congestion_delay_index(
     if free_flow_kmh <= 0 or speed_kmh <= 0:
         return None
     return free_flow_kmh / speed_kmh
+
+
+def series_baseline(
+    speeds_kmh: list[float], statuses: list[str]
+) -> tuple[float, bool]:
+    """返回自由流速度,以及能不能用速度比作为 CDI。
+
+    见过畅通、最高速度已经达到 50 km/h,或样本够 2 小时时,用速度比。
+    只有一两拍并且高德标成畅通时,不用 50 km/h 把正常低速算成拥堵。
+    """
+    if not speeds_kmh:
+        return FREEFLOW_FLOOR_KMH, False
+    peak = max(speeds_kmh)
+    saw_smooth = "1" in statuses
+    enough = len(speeds_kmh) >= MIN_SAMPLES_FOR_FLOOR
+    if saw_smooth or peak >= FREEFLOW_FLOOR_KMH or enough:
+        if enough and not saw_smooth and peak < FREEFLOW_FLOOR_KMH:
+            return max(peak, FREEFLOW_FLOOR_KMH), True
+        return peak, True
+    return peak, False
+
+
+def cdi_for_observation(
+    free_flow_kmh: float,
+    use_ratio: bool,
+    speed_kmh: float,
+    status: str,
+) -> float | None:
+    """有自由流基线时用速度比,否则只把缓行及以上当成拥堵。"""
+    if use_ratio:
+        return congestion_delay_index(free_flow_kmh, speed_kmh)
+    fallback = STATUS_FALLBACK_CDI.get(status)
+    if fallback is not None:
+        return fallback
+    if speed_kmh <= 0:
+        return None
+    return 1.0
 
 
 def service_minutes(cdi: float) -> int:

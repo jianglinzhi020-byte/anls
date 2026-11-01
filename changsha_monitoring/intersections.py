@@ -24,6 +24,7 @@ class SegmentGeom:
     name: str
     xys: list[tuple[float, float]] = field(default_factory=list)
     speeds: dict[str, float] = field(default_factory=dict)
+    statuses: dict[str, str] = field(default_factory=dict)
 
 
 def parse_polyline_xy(polyline: str) -> list[tuple[float, float]]:
