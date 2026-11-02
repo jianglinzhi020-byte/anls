@@ -7,7 +7,11 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from changsha_monitoring.__main__ import main
-from changsha_monitoring.amap import AmapClient, AmapError
+from changsha_monitoring.amap import (
+    AmapClient,
+    AmapError,
+    QuotaExceeded,
+)
 from changsha_monitoring.cdi import (
     cdi_for_observation,
     free_flow_speed,
@@ -15,7 +19,14 @@ from changsha_monitoring.cdi import (
     service_minutes,
     tasks_from_samples,
 )
-from changsha_monitoring.collect import SHANGHAI, collect_once, collect_series
+from changsha_monitoring.collect import (
+    SHANGHAI,
+    circle_for_slot,
+    collect_circle_series,
+    collect_once,
+    collect_series,
+    snapshot_name,
+)
 from changsha_monitoring.geo import haversine_m
 from changsha_monitoring.instances import (
     instance_name,
@@ -25,7 +36,14 @@ from changsha_monitoring.instances import (
 )
 from changsha_monitoring.landing_pads import curated_landing_pads
 from changsha_monitoring.pipeline import build_dataset
-from changsha_monitoring.region import traffic_tiles
+from changsha_monitoring.quota import DailyQuota
+from changsha_monitoring.region import (
+    CENTER_LAT,
+    CENTER_LON,
+    CIRCLE_RADIUS_M,
+    traffic_circles,
+    traffic_tiles,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -350,6 +368,10 @@ def test_cli_tiles_and_missing_key(
 ) -> None:
     assert main(["tiles", "--limit", "1"]) == 0
     assert "环带矩形" in capsys.readouterr().out
+    assert main(["circles", "--limit", "1"]) == 0
+    captured = capsys.readouterr().out
+    assert "圆形矩阵" in captured
+    assert "100" in captured
     monkeypatch.delenv("AMAP_KEY", raising=False)
     monkeypatch.delenv("GAODE_KEY", raising=False)
     monkeypatch.setattr(
@@ -357,3 +379,193 @@ def test_cli_tiles_and_missing_key(
     )
     assert main(["collect", "--once"]) == 2
     assert "AMAP_KEY" in capsys.readouterr().err
+
+
+def test_circles_overlap_on_the_periurban_ring() -> None:
+    circles = traffic_circles()
+    assert len(circles) == 8
+    for circle in circles:
+        assert circle.radius_m == CIRCLE_RADIUS_M
+        distance = haversine_m(CENTER_LON, CENTER_LAT, circle.lon, circle.lat)
+        assert 10_500 < distance < 11_500
+    for index, circle in enumerate(circles):
+        nxt = circles[(index + 1) % len(circles)]
+        gap = haversine_m(circle.lon, circle.lat, nxt.lon, nxt.lat)
+        assert gap < 10_000
+
+
+def test_circle_rotation_repeats_every_two_hours() -> None:
+    circles = traffic_circles()
+    midnight = datetime(2026, 11, 3, 0, 0, tzinfo=SHANGHAI)
+    assert circle_for_slot(midnight, circles).circle_id == "C00"
+    quarter = midnight + timedelta(minutes=15)
+    assert circle_for_slot(quarter, circles).circle_id == "C01"
+    again = midnight + timedelta(hours=2)
+    assert circle_for_slot(again, circles).circle_id == "C00"
+
+
+def test_quota_blocks_the_call_past_one_hundred(tmp_path: Path) -> None:
+    moment = {"now": datetime(2026, 11, 3, 10, 0, tzinfo=SHANGHAI)}
+    quota = DailyQuota(
+        tmp_path / "quota.json",
+        limit=100,
+        now=lambda: moment["now"],
+    )
+    for index in range(100):
+        assert quota.reserve() == index + 1
+    try:
+        quota.reserve()
+    except QuotaExceeded as exc:
+        assert "100" in str(exc)
+    else:
+        raise AssertionError("第 101 次应当被拒绝")
+    assert quota.used() == 100
+    moment["now"] = datetime(2026, 11, 4, 0, 1, tzinfo=SHANGHAI)
+    assert quota.used() == 0
+    assert quota.reserve() == 1
+
+
+def test_one_day_of_circles_stays_under_the_cap(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def opener(url: str, timeout: float) -> bytes:
+        calls["n"] += 1
+        assert "traffic/status/circle" in url
+        assert "radius=5000" in url
+        assert "secret-key" in url
+        assert timeout == 20.0
+        return _ok_payload()
+
+    client = AmapClient(
+        "secret-key", opener=opener, sleep=lambda _seconds: None
+    )
+    start = datetime(2026, 11, 3, 0, 0, tzinfo=SHANGHAI)
+    clock = _Clock()
+    clock.now = start
+    quota = DailyQuota(
+        tmp_path / "quota.json",
+        limit=100,
+        now=lambda: clock.now,
+    )
+    paths, reason = collect_circle_series(
+        client,
+        tmp_path / "snapshots",
+        hours=24,
+        interval_min=15,
+        quota=quota,
+        now=clock,
+        sleep=clock.sleep,
+    )
+    assert reason == ""
+    assert len(paths) == 96
+    assert calls["n"] == 96
+    assert quota.used() == 96
+    counts: dict[str, int] = {}
+    for path in paths:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert "secret-key" not in path.read_text(encoding="utf-8")
+        query = saved["query"]
+        assert isinstance(query, dict)
+        circle_id = str(query["circle_id"])
+        counts[circle_id] = counts.get(circle_id, 0) + 1
+    assert counts == {f"C{index:02d}": 12 for index in range(8)}
+
+
+def test_circle_series_stops_without_an_extra_request(
+    tmp_path: Path,
+) -> None:
+    calls = {"n": 0}
+
+    def opener(url: str, timeout: float) -> bytes:
+        calls["n"] += 1
+        return _ok_payload()
+
+    client = AmapClient(
+        "secret-key", opener=opener, sleep=lambda _seconds: None
+    )
+    start = datetime(2026, 11, 3, 8, 0, tzinfo=SHANGHAI)
+    clock = _Clock()
+    clock.now = start
+    quota = DailyQuota(tmp_path / "quota.json", limit=2, now=lambda: clock.now)
+    paths, reason = collect_circle_series(
+        client,
+        tmp_path,
+        hours=2,
+        interval_min=15,
+        quota=quota,
+        now=clock,
+        sleep=clock.sleep,
+    )
+    assert calls["n"] == 2
+    assert len(paths) == 2
+    assert quota.used() == 2
+    assert "2" in reason
+
+
+def test_existing_circle_snapshot_does_not_reserve(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def opener(url: str, timeout: float) -> bytes:
+        calls["n"] += 1
+        return _ok_payload()
+
+    start = datetime(2026, 11, 3, 8, 0, tzinfo=SHANGHAI)
+    (tmp_path / snapshot_name(start)).write_text("{}", encoding="utf-8")
+    client = AmapClient(
+        "secret-key", opener=opener, sleep=lambda _seconds: None
+    )
+    clock = _Clock()
+    clock.now = start
+    quota = DailyQuota(
+        tmp_path / "quota.json", limit=100, now=lambda: clock.now
+    )
+    paths, reason = collect_circle_series(
+        client,
+        tmp_path,
+        hours=0.5,
+        interval_min=15,
+        quota=quota,
+        now=clock,
+        sleep=clock.sleep,
+    )
+    assert reason == ""
+    assert len(paths) == 2
+    assert calls["n"] == 1
+    assert quota.used() == 1
+
+
+def test_remote_daily_limit_is_not_retried(tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    def opener(url: str, timeout: float) -> bytes:
+        calls["n"] += 1
+        body = {
+            "status": "0",
+            "info": "USER_DAILY_QUERY_OVER_LIMIT",
+            "infocode": "10044",
+        }
+        return json.dumps(body).encode("utf-8")
+
+    client = AmapClient(
+        "secret-key", opener=opener, sleep=lambda _seconds: None
+    )
+    start = datetime(2026, 11, 3, 8, 0, tzinfo=SHANGHAI)
+    clock = _Clock()
+    clock.now = start
+    quota = DailyQuota(
+        tmp_path / "quota.json", limit=100, now=lambda: clock.now
+    )
+    paths, reason = collect_circle_series(
+        client,
+        tmp_path,
+        hours=1,
+        interval_min=15,
+        quota=quota,
+        now=clock,
+        sleep=clock.sleep,
+    )
+    assert calls["n"] == 1
+    assert paths == []
+    assert "DAILY_QUERY_OVER_LIMIT" in reason
+    assert quota.used() == 100
+    assert "secret-key" not in reason

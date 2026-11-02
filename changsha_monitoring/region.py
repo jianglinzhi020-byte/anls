@@ -17,6 +17,11 @@ ROAD_LEVEL = 4
 SAMPLE_MINUTES = 15
 COLLECTION_HOURS = 24
 TILE_STEP_M = 6_000.0
+# 高德圆形交通态势半径上限 5000 米。8 个圆铺在城郊环上。
+CIRCLE_RADIUS_M = 5_000.0
+CIRCLE_RING_M = 11_000.0
+CIRCLE_COUNT = 8
+DAILY_CALL_LIMIT = 100
 TARGET_INTERSECTIONS = 89
 TARGET_TASKS = 135
 TARGET_PADS = 30
@@ -71,6 +76,53 @@ def _rect_hits_ring(
         for north in (north0, north1)
     )
     return closest <= OUTER_RADIUS_M and farthest >= INNER_RADIUS_M
+
+
+@dataclass(frozen=True)
+class Circle:
+    """高德圆形交通态势的一次查询。"""
+
+    circle_id: str
+    name: str
+    lon: float
+    lat: float
+    radius_m: float = CIRCLE_RADIUS_M
+
+    def location(self) -> str:
+        """经度在前,纬度在后。"""
+        return f"{self.lon:.6f},{self.lat:.6f}"
+
+
+def traffic_circles(
+    count: int = CIRCLE_COUNT,
+    ring_m: float = CIRCLE_RING_M,
+    radius_m: float = CIRCLE_RADIUS_M,
+) -> list[Circle]:
+    """在城郊环上均匀放一组圆,相邻圆互相重叠。
+
+    圆心距五一广场约 11 公里,半径取接口上限 5 公里,
+    沿半径方向大约盖住 6 到 16 公里。
+    """
+    if radius_m > CIRCLE_RADIUS_M:
+        raise ValueError("圆形半径不能超过 5000 米")
+    names = ("北", "东北", "东", "东南", "南", "西南", "西", "西北")
+    circles: list[Circle] = []
+    for index in range(count):
+        bearing = 2 * math.pi * index / count
+        east = ring_m * math.sin(bearing)
+        north = ring_m * math.cos(bearing)
+        lon, lat = to_lonlat(east, north, CENTER_LON, CENTER_LAT)
+        name = names[index] if index < len(names) else f"{index}"
+        circles.append(
+            Circle(
+                circle_id=f"C{index:02d}",
+                name=name,
+                lon=lon,
+                lat=lat,
+                radius_m=radius_m,
+            )
+        )
+    return circles
 
 
 def traffic_tiles(step_m: float = TILE_STEP_M) -> list[Tile]:

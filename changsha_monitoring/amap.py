@@ -1,4 +1,4 @@
-"""高德矩形交通态势客户端。"""
+"""高德交通态势客户端,支持矩形和圆形查询。"""
 
 from __future__ import annotations
 
@@ -9,15 +9,24 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from changsha_monitoring.region import ROAD_LEVEL, Tile
+from changsha_monitoring.region import ROAD_LEVEL, Circle, Tile
 
 RECTANGLE_URL = "https://restapi.amap.com/v3/traffic/status/rectangle"
+CIRCLE_URL = "https://restapi.amap.com/v3/traffic/status/circle"
 # 这些错误重试也不会成功。
 _FATAL_INFOCODES = {"10001", "10002", "10003", "10009"}
 
 
 class AmapError(RuntimeError):
     """高德接口拒绝或返回无法解析。"""
+
+
+class QuotaExceeded(AmapError):
+    """本地日额度或高德日访问量已经用完。"""
+
+
+def is_daily_limit(info: str, infocode: str = "") -> bool:
+    return "DAILY_QUERY_OVER_LIMIT" in info.upper() or infocode == "10044"
 
 
 def _urlopen_bytes(url: str, timeout: float) -> bytes:
@@ -148,6 +157,7 @@ class AmapClient:
         level: int = ROAD_LEVEL,
         opener: Callable[[str, float], bytes] | None = None,
         sleep: Callable[[float], None] | None = None,
+        before_request: Callable[[], object] | None = None,
     ) -> None:
         if not key.strip():
             raise AmapError("缺少高德 Web 服务 Key")
@@ -155,6 +165,12 @@ class AmapClient:
         self.level = level
         self._opener = opener or _urlopen_bytes
         self._sleep = sleep or time.sleep
+        self._before = before_request
+
+    def bind_before_request(
+        self, callback: Callable[[], object] | None
+    ) -> None:
+        self._before = callback
 
     def __repr__(self) -> str:
         return f"AmapClient(level={self.level})"
@@ -174,10 +190,28 @@ class AmapClient:
         url = f"{RECTANGLE_URL}?{query}"
         return self._read(url)
 
+    def traffic_circle(self, circle: Circle) -> dict[str, object]:
+        if circle.radius_m > 5_000:
+            raise AmapError(f"{circle.circle_id} 半径超过 5000 米")
+        query = urllib.parse.urlencode(
+            {
+                "key": self._key,
+                "location": circle.location(),
+                "radius": str(int(circle.radius_m)),
+                "level": str(self.level),
+                "extensions": "all",
+                "output": "JSON",
+            }
+        )
+        url = f"{CIRCLE_URL}?{query}"
+        return self._read(url)
+
     def _read(self, url: str) -> dict[str, object]:
         delay = 1.0
         last_error = "请求失败"
         for attempt in range(3):
+            if self._before is not None:
+                self._before()
             try:
                 raw = self._opener(url, 20.0)
                 payload = json.loads(raw.decode("utf-8"))
@@ -193,10 +227,12 @@ class AmapClient:
                 break
             if str(payload.get("status")) == "1":
                 return payload
-            last_error = str(
-                payload.get("info") or payload.get("infocode") or "未知错误"
-            )
-            if str(payload.get("infocode") or "") in _FATAL_INFOCODES:
+            info = str(payload.get("info") or "")
+            infocode = str(payload.get("infocode") or "")
+            last_error = info or infocode or "未知错误"
+            if is_daily_limit(info, infocode):
+                raise QuotaExceeded(last_error)
+            if infocode in _FATAL_INFOCODES:
                 break
             if attempt == 2:
                 break

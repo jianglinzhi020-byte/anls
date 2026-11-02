@@ -4,18 +4,28 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
-from changsha_monitoring.amap import AmapError
+from changsha_monitoring.amap import AmapClient, AmapError
 from changsha_monitoring.collect import (
+    SHANGHAI,
+    align_slot,
+    circle_for_slot,
+    collect_circle_once,
+    collect_circle_series,
     collect_once,
     collect_series,
     default_client,
 )
 from changsha_monitoring.pipeline import build_dataset
+from changsha_monitoring.quota import QUOTA_FILE, DailyQuota
 from changsha_monitoring.region import (
+    CIRCLE_RADIUS_M,
     COLLECTION_HOURS,
+    DAILY_CALL_LIMIT,
     SAMPLE_MINUTES,
+    traffic_circles,
     traffic_tiles,
 )
 
@@ -32,6 +42,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     tiles = sub.add_parser("tiles", help="列出环带上的高德矩形,不访问网络")
     tiles.add_argument("--limit", type=int, default=0, help="只打印前 N 块")
+
+    circles = sub.add_parser("circles", help="列出每日圆形矩阵,不访问网络")
+    circles.add_argument("--limit", type=int, default=0, help="只打印前 N 个")
 
     collect = sub.add_parser("collect", help="调用高德交通态势接口采样")
     collect.add_argument(
@@ -52,10 +65,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="只采当前这一个 15 分钟槽",
     )
     collect.add_argument(
+        "--shape",
+        choices=("circle", "rectangle"),
+        default="circle",
+        help="默认每拍 1 个圆,全天不超过 100 次",
+    )
+    collect.add_argument(
         "--max-tiles",
         type=int,
         default=0,
-        help="只请求前 N 个矩形,用来检查 Key",
+        help="矩形模式下只请求前 N 块",
     )
     collect.add_argument(
         "--out",
@@ -75,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "tiles":
             return _print_tiles(args.limit)
+        if args.command == "circles":
+            return _print_circles(args.limit)
         if args.command == "collect":
             return _collect(args)
         if args.command == "build":
@@ -97,16 +118,33 @@ def _print_tiles(limit: int) -> int:
     return 0
 
 
+def _print_circles(limit: int) -> int:
+    circles = traffic_circles()
+    shown = circles if limit <= 0 else circles[:limit]
+    print(
+        f"圆形矩阵 {len(circles)} 个,半径 {CIRCLE_RADIUS_M:.0f} 米,"
+        f"每拍 1 次,每天不超过 {DAILY_CALL_LIMIT} 次"
+    )
+    for circle in shown:
+        print(
+            f"{circle.circle_id}{circle.name}  {circle.location()}  "
+            f"半径 {circle.radius_m:.0f} 米"
+        )
+    return 0
+
+
 def _collect(args: argparse.Namespace) -> int:
     client = default_client()
+    if args.shape == "circle":
+        return _collect_circles(args, client)
+    print(
+        "矩形模式不按每日 100 次封顶,全天会超过额度。",
+        file=sys.stderr,
+    )
     tiles = traffic_tiles()
     if args.max_tiles:
         tiles = tiles[: args.max_tiles]
     if args.once:
-        from datetime import datetime
-
-        from changsha_monitoring.collect import SHANGHAI, align_slot
-
         slot = align_slot(datetime.now(SHANGHAI), args.interval)
         path = collect_once(client, tiles, slot, args.out)
         print(f"已写入 {path}")
@@ -119,6 +157,32 @@ def _collect(args: argparse.Namespace) -> int:
         max_tiles=args.max_tiles or None,
     )
     print(f"完成 {len(paths)} 个时间槽,目录 {args.out}")
+    return 0
+
+
+def _collect_circles(args: argparse.Namespace, client: AmapClient) -> int:
+    quota = DailyQuota(QUOTA_FILE, DAILY_CALL_LIMIT)
+    client.bind_before_request(quota.reserve)
+    circles = traffic_circles()
+    if args.once:
+        slot = align_slot(datetime.now(SHANGHAI), args.interval)
+        circle = circle_for_slot(slot, circles, args.interval)
+        path = collect_circle_once(client, circle, slot, args.out)
+        print(f"已写入 {path} {circle.circle_id}{circle.name}")
+        print(f"今日已用 {quota.used()} / {DAILY_CALL_LIMIT} 次")
+        return 0
+    paths, reason = collect_circle_series(
+        client,
+        args.out,
+        hours=args.hours,
+        interval_min=args.interval,
+        quota=quota,
+        circles=circles,
+    )
+    if reason:
+        print(reason)
+    print(f"完成 {len(paths)} 个时间槽,目录 {args.out}")
+    print(f"今日已用 {quota.used()} / {DAILY_CALL_LIMIT} 次")
     return 0
 
 
