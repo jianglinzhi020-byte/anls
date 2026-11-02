@@ -74,3 +74,6 @@ venv/
 
 # macOS
 *.DS_Store
+
+# Generated Changsha traffic snapshots and instances
+data/changsha/
